@@ -38,13 +38,17 @@ def lowest_z(product):
 def add_support(product, bbox_min=None, bbox_max=None):
     found_points = []
     support_boxes = []
-    max_iterations = 500
-    min_distance = 4.5
-    min_distance_sq = min_distance * min_distance  # 거리 제곱으로 비교 (sqrt 연산 제거)
     
     # 박스 크기 (1mm x 1mm)
     width = 0.5
     depth = 0.5
+    
+    # 서포트 최대 갯수와 최소 간격
+    max_iterations = 50
+    min_distance = 4.5
+
+    min_distance_sq = min_distance * min_distance  # 거리 제곱으로 비교 (sqrt 연산 제거)
+    
     
     # mesh를 한 번만 가져오기
     meshes = []
@@ -191,7 +195,7 @@ def main():
     base = add_base(product, bbox_min, bbox_max)
     
     # add text
-    text = add_text(product, '001', bbox_min, bbox_max)
+    text = add_text(product, '003', bbox_min, bbox_max)
     
     # boolean op.
     # 1. support와 base를 union
