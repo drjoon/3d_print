@@ -24,13 +24,8 @@ def create_support(product_ids):
     3. 위 1에서 만들어진 박스에서 위 2번에서 만들어진 크라운 복제품을 빼 (mesh boolean difference)
     """
     # 1. 바운딩 박스로 메쉬 박스 생성
-    bbox = rg.BoundingBox.Empty
-    for obj_id in product_ids:
-        obj = sc.doc.Objects.Find(obj_id)
-        if obj:
-            bbox.Union(obj.Geometry.GetBoundingBox(True))
-
-    if not bbox.IsValid:
+    bbox = rs.BoundingBox(product_ids)
+    if not bbox:
         print("Error: Cannot get bounding box.")
         return None
 
@@ -57,6 +52,7 @@ def create_support(product_ids):
         return None
     
     mesh_box = BrepToMesh(box_brep)
+    rs.DeleteObject(box_brep)
 
     # 2. 크라운 복제 및 확대
     product_meshes = []
@@ -74,32 +70,7 @@ def create_support(product_ids):
         combined_product_mesh.Append(m)
 
     offset_mesh = combined_product_mesh.Duplicate()
-    
-    # 수동으로 메쉬 오프셋 구현
-    offset_distance = 0.05
-    offset_mesh.Normals.ComputeNormals() # 법선 벡터 계산
-    vertices = offset_mesh.Vertices
-    normals = offset_mesh.Normals
-
-    if vertices.Count != normals.Count:
-        print("Error: Vertex count and normal count do not match.")
-        return None
-
-    new_vertices = []
-    for i in range(offset_mesh.Vertices.Count):
-        # 인덱스를 사용하여 데이터에 직접 접근
-        vertex = offset_mesh.Vertices[i]
-        normal = offset_mesh.Normals[i]
-        
-        # 새로운 Point3f 객체 생성
-        new_pt = rg.Point3f(vertex.X + normal.X * offset_distance,
-                            vertex.Y + normal.Y * offset_distance,
-                            vertex.Z + normal.Z * offset_distance)
-        new_vertices.append(new_pt)
-    
-    # 정점 목록을 한 번에 교체
-    offset_mesh.Vertices.Clear()
-    offset_mesh.Vertices.AddVertices(new_vertices)
+    offset_mesh.Offset(0.05, True)
 
     # 3. 불리언 차집합으로 서포트 생성
     support_mesh = rg.Mesh.CreateBooleanDifference([mesh_box], [offset_mesh])

@@ -102,7 +102,8 @@ def BrepToMesh(brep_id):
         for mesh_part in mesh_parts:
             mesh.Append(mesh_part)
         mesh.Compact()
-        return sc.doc.Objects.AddMesh(mesh)
+        rs.DeleteObject(brep_id)
+        return mesh
 
 
 def ExportToSTL(objs):
