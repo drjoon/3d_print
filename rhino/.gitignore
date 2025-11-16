@@ -1,0 +1,8 @@
+node_modules
+.DS_Store
+.env
+__pycache__
+.pytest_cache
+.rhl
+*.3dm
+*.3dm.rhl
