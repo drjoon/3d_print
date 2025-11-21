@@ -17,10 +17,15 @@ import Rhino.Geometry as rg
 from lib.globals import *
 
 
-def create_support(product_ids, offset, height):
+def create_support(product_ids, offset, center_only_holes=False):
     """
     RhinoCommon API를 사용하여 메모리 효율적으로 서포트를 생성합니다.
     """
+    # 디버그용 플래그: 단계별 기능 온/오프
+    ENABLE_GROOVES = True          # 바닥 홈 패턴
+    ENABLE_HOLES = True            # 수직 배기홀
+    ENABLE_OFFSET_BOOLEAN = True   # 제품 offset 메쉬와의 최종 BooleanDifference
+
     # --- 1. 입력 메쉬 집합 생성 ---
     product_meshes = []
     for obj_id in product_ids:
@@ -29,7 +34,7 @@ def create_support(product_ids, offset, height):
             product_meshes.append(obj.Geometry)
     
     if not product_meshes:
-        print("Error: No valid mesh objects found.")
+        print("[create_support] Error: No valid mesh objects found.")
         return None
 
     # --- 2. 서포트 베이스 박스 메쉬 생성 (메모리 내) ---
@@ -38,14 +43,165 @@ def create_support(product_ids, offset, height):
         bbox.Union(mesh.GetBoundingBox(True))
 
     if not bbox.IsValid:
-        print("Error: Cannot get bounding box for support base.")
+        print("[create_support] Error: Cannot get bounding box for support base.")
         return None
 
-    base_bbox = rg.BoundingBox(bbox.Min.X, bbox.Min.Y, 0, bbox.Max.X, bbox.Max.Y, height)
+    # 서포트 높이를 제품 높이의 1/3로 자동 결정
+    product_height = bbox.Max.Z - bbox.Min.Z
+    height = max(product_height / 3.0, 2)  # 최소 2mm 보장
+
+    # XY 평면에서 중심 기준으로 1.05배 스케일링
+    center_x = (bbox.Min.X + bbox.Max.X) / 2.0
+    center_y = (bbox.Min.Y + bbox.Max.Y) / 2.0
+    half_width_x = (bbox.Max.X - bbox.Min.X) * 0.5 * 1.1
+    half_width_y = (bbox.Max.Y - bbox.Min.Y) * 0.5 * 1.1
+    min_x = center_x - half_width_x
+    max_x = center_x + half_width_x
+    min_y = center_y - half_width_y
+    max_y = center_y + half_width_y
+    base_bbox = rg.BoundingBox(min_x, min_y, 0, max_x, max_y, height)
+    # 서포트 기본 박스 메쉬 (기본값)
     support_box_mesh = rg.Mesh.CreateFromBox(base_bbox, 1, 1, 1)
     if not support_box_mesh:
-        print("Error: Failed to create support base mesh.")
+        print("[create_support] Error: Failed to create support base mesh.")
         return None
+
+    # 모든 기능이 꺼져 있으면 단순 박스만 생성하고 바로 리턴
+    if not ENABLE_GROOVES and not ENABLE_HOLES and not ENABLE_OFFSET_BOOLEAN:
+        support_id = sc.doc.Objects.AddMesh(support_box_mesh)
+        try:
+            assign_object([support_id], 'print_support', 'support')
+        except Exception as e:
+            print('[create_support] Warning: failed to assign simple support box to layer:', e)
+        print("[create_support] simple box only | id =", support_id)
+        return [support_id]
+
+    # --- 2-1. 바닥 홈 패턴 생성 (50% 접촉 / 50% 홈) ---
+    groove_breps = []
+    groove_depth = min(0.3, height * 0.6)  # 홈 깊이
+    solid_ratio = 0.5                       # 접촉 비율
+    target_groove_count = 8                 # 목표 홈 개수
+
+    base_width_y = max_y - min_y
+    if base_width_y > 0 and target_groove_count > 0:
+        # 양쪽 끝이 항상 solid가 되도록 피치 계산 (n개의 홈, n+1개의 solid)
+        solid_parts = target_groove_count + 1
+        total_solid_width = base_width_y * solid_ratio
+        total_gap_width = base_width_y - total_solid_width
+        
+        single_solid_width = total_solid_width / solid_parts
+        single_gap_width = total_gap_width / target_groove_count
+
+        current_y = min_y
+        for i in range(target_groove_count):
+            current_y += single_solid_width
+            groove_start = current_y
+            groove_end = groove_start + single_gap_width
+            
+            if groove_end > groove_start:
+                groove_bbox = rg.BoundingBox(
+                    min_x,
+                    groove_start,
+                    -0.01,
+                    max_x,
+                    groove_end,
+                    groove_depth + 0.01,
+                )
+                groove_box = rg.Box(groove_bbox)
+                groove_brep = rg.Brep.CreateFromBox(groove_box)
+                if groove_brep:
+                    groove_breps.append(groove_brep)
+            current_y = groove_end
+
+    # --- 2-2. 수직 배기홀 Brep 생성 ---
+    hole_breps = []
+    hole_radius = 0.7
+
+    if ENABLE_HOLES and groove_breps:
+        # center_only_holes=True 이면 각 홈당 가운데 한 줄만, False면 여러 줄
+        default_row_count = 3
+        for groove_brep in groove_breps:
+            groove_bb = groove_brep.GetBoundingBox(True)
+            if not groove_bb.IsValid:
+                continue
+
+            groove_width_x = groove_bb.Max.X - groove_bb.Min.X
+
+            if center_only_holes:
+                center_x_list = [groove_bb.Center.X]
+            else:
+                hole_row_count = default_row_count
+                # 행 간격 계산 (양 끝에 여유 공간 확보)
+                row_spacing = groove_width_x / (hole_row_count + 1)
+                center_x_list = [
+                    groove_bb.Min.X + row_spacing * (i + 1)
+                    for i in range(hole_row_count)
+                ]
+
+            for center_x in center_x_list:
+                center_y = groove_bb.Center.Y
+
+                base_point = rg.Point3d(center_x, center_y, 0)
+                top_point = rg.Point3d(center_x, center_y, height)
+                axis = rg.Line(base_point, top_point)
+                circle = rg.Circle(rg.Plane(base_point, rg.Vector3d.ZAxis), hole_radius)
+                cylinder = rg.Cylinder(circle, axis.Length)
+                brep = cylinder.ToBrep(True, True)
+                if brep:
+                    hole_breps.append(brep)
+
+    # 홈/홀 모두 꺼져 있으면 Brep 파이프라인을 건너뛰고 단순 박스 메쉬만 사용
+    if not ENABLE_GROOVES and not ENABLE_HOLES:
+        current_support_meshes = [support_box_mesh]
+    else:
+        # --- 2-3. 바닥 홈 + 수직홀을 base Brep에서 차집합 ---
+        base_box = rg.Box(base_bbox)
+        base_brep = rg.Brep.CreateFromBox(base_box)
+        if not base_brep:
+            print("[create_support] Error: Failed to create base Brep, using simple box mesh")
+            current_support_meshes = [support_box_mesh]
+        else:
+            tool_breps = []
+            if ENABLE_GROOVES:
+                tool_breps.extend(groove_breps)
+            if ENABLE_HOLES:
+                tool_breps.extend(hole_breps)
+
+            result_breps = [base_brep]
+            if tool_breps:
+                try:
+                    diff_result = rg.Brep.CreateBooleanDifference([base_brep], tool_breps, sc.doc.ModelAbsoluteTolerance)
+                    if diff_result:
+                        result_breps = list(diff_result)
+                        pass
+                    else:
+                        pass
+                except Exception as e:
+                    print("Error: base Brep boolean (grooves+holes) failed: {}".format(e))
+
+            # --- 2-4. Brep -> 메쉬 변환 ---
+            current_support_meshes = []
+            mp = rg.MeshingParameters.QualityRenderMesh
+            angle_tolerance = sc.doc.ModelAngleToleranceRadians
+            for b in result_breps:
+                meshes = rg.Mesh.CreateFromBrep(b, mp)
+                if meshes:
+                    for mesh in meshes:
+                        mesh.Weld(angle_tolerance)
+                        mesh.UnifyNormals()
+                        mesh.RebuildNormals()
+                        current_support_meshes.append(mesh)
+
+            if not current_support_meshes:
+                print("Error: Brep->Mesh conversion produced no meshes, using simple box mesh")
+                current_support_meshes = [support_box_mesh]
+            elif len(current_support_meshes) > 1:
+                base_mesh = current_support_meshes[0]
+                base_mesh.Append(current_support_meshes[1:])
+                base_mesh.Weld(angle_tolerance)
+                base_mesh.UnifyNormals()
+                base_mesh.RebuildNormals()
+                current_support_meshes = [base_mesh]
 
     # --- 3. 입력 메쉬들을 Offset (메모리 내) ---
     offset_meshes = []
@@ -57,11 +213,12 @@ def create_support(product_ids, offset, height):
             # Offset 결과가 단일 메쉬일 수도 있고, 메쉬 리스트일 수도 있음
             if isinstance(offset_results, rg.Mesh):
                 offset_meshes.append(offset_results)
-            else: # 리스트인 경우
+            else:  # 리스트인 경우
                 offset_meshes.extend(offset_results)
 
+    print("[create_support] offset mesh count =", len(offset_meshes))
     if not offset_meshes:
-        print("Error: Mesh.Offset operation failed.")
+        print("[create_support] Error: Mesh.Offset operation failed.")
         return None
 
     # for mesh in offset_meshes:
@@ -69,15 +226,22 @@ def create_support(product_ids, offset, height):
     # return
 
     # --- 4. 불리언 차집합 실행 (메모리 내) ---
-    try:
-        final_support_meshes = rg.Mesh.CreateBooleanDifference([support_box_mesh], offset_meshes)
-    except Exception as e:
-        print("Error during BooleanDifference: {}".format(e))
-        return None
+    final_support_meshes = None
 
-    if not final_support_meshes or len(final_support_meshes) == 0:
-        print("Error: BooleanDifference resulted in no meshes.")
-        return None
+    if ENABLE_OFFSET_BOOLEAN:
+        try:
+            print("[create_support] running final boolean with offset meshes...")
+            final_support_meshes = rg.Mesh.CreateBooleanDifference(current_support_meshes, offset_meshes)
+        except Exception as e:
+            print("[create_support] Error during BooleanDifference with offset meshes: {}".format(e))
+
+    if not ENABLE_OFFSET_BOOLEAN or not final_support_meshes or len(final_support_meshes) == 0:
+        # BooleanDifference를 끄거나 실패 시, 홈/홀만 적용된(혹은 없는) 기본 서포트를 사용
+        if ENABLE_OFFSET_BOOLEAN:
+            print("[create_support] Warning: BooleanDifference resulted in no meshes. Using support without product offset.")
+        final_support_meshes = current_support_meshes
+
+    print("[create_support] final_support_meshes count =", len(final_support_meshes))
 
     # --- 5. 최종 메쉬 복구 및 Rhino 문서에 추가 ---
     final_support_ids = []
@@ -90,7 +254,15 @@ def create_support(product_ids, offset, height):
         mesh.RebuildNormals()
         mesh.Compact()
         final_support_ids.append(sc.doc.Objects.AddMesh(mesh))
-    
+
+    # 서포트를 전용 레이어에 배치하고 이름 지정
+    if final_support_ids:
+        try:
+            assign_object(final_support_ids, 'print_support', 'support')
+        except Exception as e:
+            print('[create_support] Warning: failed to assign support objects to layer:', e)
+
+    print("[create_support] created support object ids:", final_support_ids)
     return final_support_ids
 
 
@@ -208,40 +380,52 @@ def main():
     assign_object(product, 'print', 'product')
     
     # 2. 여러 offset 값으로 서포트 생성 및 정렬 (메모리 최적화)
-    offsets = [0.10, 0.15, 0.20, 0.25, 0.30]
+    offsets = [0.10, 0.15, 0.20]
     total_x_shift = 0.0
     all_created_objects = []
 
     try:
         rs.EnableRedraw(False)
         for offset_val in offsets:
-            # 1. 원본 위치에서 서포트 생성
-            current_product_copy = rs.CopyObjects(product)
-            support_ids = create_support(current_product_copy, offset=str(offset_val), height=2.2)
+            # 1-1. 원본 위치에서 서포트 생성 (3행 배기홀 버전)
+            full_copy = rs.CopyObjects(product)
+            full_support_ids = create_support(full_copy, offset=str(offset_val), center_only_holes=False)
 
-            if support_ids:
-                # 2. 생성된 객체 그룹화 및 바운딩 박스 계산
-                newly_created_group = current_product_copy + support_ids
+            if full_support_ids:
+                full_group = full_copy + full_support_ids
                 bbox = rg.BoundingBox.Empty
-                for obj_id in newly_created_group:
+                for obj_id in full_group:
                     obj = sc.doc.Objects.Find(obj_id)
                     if obj:
                         bbox.Union(obj.Geometry.GetBoundingBox(True))
 
                 if bbox.IsValid:
-                    # 3. 그룹을 X축으로 이동
-                    rs.MoveObjects(newly_created_group, (total_x_shift, 0, 0))
-                    all_created_objects.extend(newly_created_group)
-
-                    # 4. 다음 그룹을 위한 X축 이동 거리 업데이트
+                    # full_group의 바운딩박스를 이용해 X, Y 이동량 계산
                     width = bbox.Max.X - bbox.Min.X
-                    total_x_shift += width + 2.0 # 2mm 간격 추가
+                    full_height_y = bbox.Max.Y - bbox.Min.Y
+                    y_gap = full_height_y + 2.0  # 서포트 높이 + 2mm 여유
+
+                    # X축 정렬 (offset 별로 오른쪽으로 차례대로 배치)
+                    rs.MoveObjects(full_group, (total_x_shift, 0, 0))
+                    all_created_objects.extend(full_group)
+
+                    # 1-2. 같은 offset에 대해 가운데 1행 버전 생성
+                    center_copy = rs.CopyObjects(product)
+                    center_support_ids = create_support(center_copy, offset=str(offset_val), center_only_holes=True)
+
+                    if center_support_ids:
+                        center_group = center_copy + center_support_ids
+                        # full_group 과 같은 X 위치에서 Y 방향으로만 위로 이동
+                        rs.MoveObjects(center_group, (total_x_shift, y_gap, 0))
+                        all_created_objects.extend(center_group)
+
+                    # 다음 offset을 위한 X축 이동량 갱신
+                    total_x_shift += width + 2.0  # 서포트 사이 2mm 간격
                 else:
-                    # BBox 계산 실패 시 생성된 객체 삭제
-                    rs.DeleteObjects(newly_created_group)
+                    rs.DeleteObjects(full_group)
             else:
                 # 서포트 생성 실패 시 복사본 제거
-                rs.DeleteObjects(current_product_copy)
+                rs.DeleteObjects(full_copy)
 
         # 각 루프 후 Undo 기록 삭제하여 메모리 확보
         rs.Command('-_CommandHistory _Purge _Enter', False)
