@@ -17,14 +17,14 @@ import Rhino.Geometry as rg
 from lib.globals import *
 
 
-def create_support(product_ids, offset, center_only_holes=False):
+def create_support(product_ids, offset, height=None, center_only_holes=False):
     """
     RhinoCommon API를 사용하여 메모리 효율적으로 서포트를 생성합니다.
     """
     # 디버그용 플래그: 단계별 기능 온/오프
-    ENABLE_GROOVES = True          # 바닥 홈 패턴
-    ENABLE_HOLES = True            # 수직 배기홀
-    ENABLE_OFFSET_BOOLEAN = True   # 제품 offset 메쉬와의 최종 BooleanDifference
+    ENABLE_GROOVES = True              # 바닥 홈 패턴
+    ENABLE_HOLES = True                # 수직 배기홀
+    ENABLE_OFFSET_BOOLEAN = True       # 제품 offset 메쉬와의 최종 BooleanDifference
 
     # --- 1. 입력 메쉬 집합 생성 ---
     product_meshes = []
@@ -46,9 +46,10 @@ def create_support(product_ids, offset, center_only_holes=False):
         print("[create_support] Error: Cannot get bounding box for support base.")
         return None
 
-    # 서포트 높이를 제품 높이의 1/3로 자동 결정
-    product_height = bbox.Max.Z - bbox.Min.Z
-    height = max(product_height / 3.0, 2)  # 최소 2mm 보장
+    # height가 None이면 크라운 바운딩박스 높이의 1/4을 서포트 높이로 사용
+    if height is None:
+        bbox_height = bbox.Max.Z - bbox.Min.Z
+        height = min(bbox_height / 4.0, 2.0)
 
     # XY 평면에서 중심 기준으로 1.05배 스케일링
     center_x = (bbox.Min.X + bbox.Max.X) / 2.0
@@ -203,27 +204,64 @@ def create_support(product_ids, offset, center_only_holes=False):
                 base_mesh.RebuildNormals()
                 current_support_meshes = [base_mesh]
 
-    # --- 3. 입력 메쉬들을 Offset (메모리 내) ---
+    # --- 3. 입력 메쉬들을 Z-방향으로 이동한 복사본 생성 (offset 메쉬 대체) ---
+    # 크라운과 서포트 사이에 약간의 클리어런스를 두기 위해 offset 보다 조금 더 많이 내린다.
     offset_meshes = []
+
+    CLEARANCE_Z = 0.02  # 크라운과 서포트 사이 목표 간격(mm)
+
+    try:
+        dz = float(offset) + CLEARANCE_Z
+    except Exception:
+        dz = CLEARANCE_Z
+
+    move_down = rg.Transform.Translation(0.0, 0.0, -dz)
+
     for mesh in product_meshes:
-        # Rhino.Geometry.Mesh.Offset은 리스트를 반환할 수 있음
-        # offset 값을 음수로 전달하고 solid=True 옵션으로 닫힌 메쉬 생성
-        offset_results = mesh.Offset(-float(offset), False)
-        if offset_results:
-            # Offset 결과가 단일 메쉬일 수도 있고, 메쉬 리스트일 수도 있음
-            if isinstance(offset_results, rg.Mesh):
-                offset_meshes.append(offset_results)
-            else:  # 리스트인 경우
-                offset_meshes.extend(offset_results)
+        if not mesh:
+            continue
+        moved = mesh.DuplicateMesh()
+        if not moved:
+            continue
+        moved.Transform(move_down)
+        offset_meshes.append(moved)
 
     print("[create_support] offset mesh count =", len(offset_meshes))
     if not offset_meshes:
         print("[create_support] Error: Mesh.Offset operation failed.")
         return None
 
-    # for mesh in offset_meshes:
-    #     sc.doc.Objects.AddMesh(mesh)
-    # return
+    # --- 3-1. offset 메쉬들끼리 먼저 Boolean Union 실행 (크라운 사이 교차 제거) ---
+    if len(offset_meshes) > 1:
+        try:
+            print("[create_support] running union on offset meshes...")
+            union_result = rg.Mesh.CreateBooleanUnion(offset_meshes)
+            if union_result and len(union_result) > 0:
+                # Union 결과에서도 작은 조각 제거: 각 메쉬를 분리 후 가장 큰 조각만 유지
+                unified = []
+                for um in union_result:
+                    try:
+                        upieces = um.SplitDisjointPieces()
+                    except Exception as e:
+                        print("[create_support] Warning: SplitDisjointPieces (union) failed: {}".format(e))
+                        upieces = None
+
+                    if upieces and len(upieces) > 1:
+                        def upiece_volume(pm):
+                            bb = pm.GetBoundingBox(True)
+                            return bb.Volume if bb.IsValid else 0.0
+
+                        largest = max(upieces, key=upiece_volume)
+                        unified.append(largest)
+                    elif upieces and len(upieces) == 1:
+                        unified.append(upieces[0])
+                    else:
+                        unified.append(um)
+
+                offset_meshes = unified
+                print("[create_support] offset union result count =", len(offset_meshes))
+        except Exception as e:
+            print("[create_support] Warning: BooleanUnion on offset meshes failed: {}".format(e))
 
     # --- 4. 불리언 차집합 실행 (메모리 내) ---
     final_support_meshes = None
@@ -235,11 +273,47 @@ def create_support(product_ids, offset, center_only_holes=False):
         except Exception as e:
             print("[create_support] Error during BooleanDifference with offset meshes: {}".format(e))
 
+    # Boolean 결과에서 작은 조각(깨진 메쉬)을 제거: 각 메쉬를 분리 후 가장 큰 조각만 유지
+    if final_support_meshes and len(final_support_meshes) > 0:
+        cleaned_meshes = []
+        for m in final_support_meshes:
+            try:
+                pieces = m.SplitDisjointPieces()
+            except Exception as e:
+                print("[create_support] Warning: SplitDisjointPieces failed: {}".format(e))
+                pieces = None
+
+            if pieces and len(pieces) > 1:
+                # 바운딩 박스 부피가 가장 큰 조각을 메인 서포트로 사용
+                def piece_volume(pm):
+                    bb = pm.GetBoundingBox(True)
+                    return bb.Volume if bb.IsValid else 0.0
+
+                largest_piece = max(pieces, key=piece_volume)
+                cleaned_meshes.append(largest_piece)
+            elif pieces and len(pieces) == 1:
+                cleaned_meshes.append(pieces[0])
+            else:
+                cleaned_meshes.append(m)
+
+        final_support_meshes = cleaned_meshes
+
     if not ENABLE_OFFSET_BOOLEAN or not final_support_meshes or len(final_support_meshes) == 0:
         # BooleanDifference를 끄거나 실패 시, 홈/홀만 적용된(혹은 없는) 기본 서포트를 사용
         if ENABLE_OFFSET_BOOLEAN:
             print("[create_support] Warning: BooleanDifference resulted in no meshes. Using support without product offset.")
         final_support_meshes = current_support_meshes
+
+    # --- 4-2. 최종 서포트에서 원본 크라운 메쉬를 한 번 더 차집합 ---
+    # 서포트와 크라운이 겹치는 부분(인접면의 깨진 조각 등)을 강제로 제거
+    try:
+        if final_support_meshes and product_meshes:
+            print("[create_support] running final cleanup boolean with original product meshes...")
+            cleaned = rg.Mesh.CreateBooleanDifference(final_support_meshes, product_meshes)
+            if cleaned and len(cleaned) > 0:
+                final_support_meshes = list(cleaned)
+    except Exception as e:
+        print("[create_support] Warning: final cleanup boolean with product meshes failed: {}".format(e))
 
     print("[create_support] final_support_meshes count =", len(final_support_meshes))
 
@@ -380,7 +454,7 @@ def main():
     assign_object(product, 'print', 'product')
     
     # 2. 여러 offset 값으로 서포트 생성 및 정렬 (메모리 최적화)
-    offsets = [0.10, 0.15, 0.20]
+    offsets = [0.05, 0.10, 0.15, 0.20]
     total_x_shift = 0.0
     all_created_objects = []
 
@@ -389,7 +463,7 @@ def main():
         for offset_val in offsets:
             # 1-1. 원본 위치에서 서포트 생성 (3행 배기홀 버전)
             full_copy = rs.CopyObjects(product)
-            full_support_ids = create_support(full_copy, offset=str(offset_val), center_only_holes=False)
+            full_support_ids = create_support(full_copy, offset=str(offset_val), height=2.3, center_only_holes=False)
 
             if full_support_ids:
                 full_group = full_copy + full_support_ids
@@ -411,7 +485,7 @@ def main():
 
                     # 1-2. 같은 offset에 대해 가운데 1행 버전 생성
                     center_copy = rs.CopyObjects(product)
-                    center_support_ids = create_support(center_copy, offset=str(offset_val), center_only_holes=True)
+                    center_support_ids = create_support(center_copy, offset=str(offset_val), height=None, center_only_holes=True)
 
                     if center_support_ids:
                         center_group = center_copy + center_support_ids
