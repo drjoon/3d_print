@@ -23,8 +23,8 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
     """
     # 디버그용 플래그: 단계별 기능 온/오프
     ENABLE_GROOVES = True              # 바닥 홈 패턴
-    ENABLE_HOLES = True                # 수직 배기홀
     ENABLE_OFFSET_BOOLEAN = True       # 제품 offset 메쉬와의 최종 BooleanDifference
+    ENABLE_OFFSET_DEBUG = False        # offset 메쉬를 문서에 추가해서 눈으로 확인 (느려질 수 있음)
 
     # --- 1. 입력 메쉬 집합 생성 ---
     product_meshes = []
@@ -114,45 +114,8 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
                     groove_breps.append(groove_brep)
             current_y = groove_end
 
-    # --- 2-2. 수직 배기홀 Brep 생성 ---
-    hole_breps = []
-    hole_radius = 0.7
-
-    if ENABLE_HOLES and groove_breps:
-        # center_only_holes=True 이면 각 홈당 가운데 한 줄만, False면 여러 줄
-        default_row_count = 3
-        for groove_brep in groove_breps:
-            groove_bb = groove_brep.GetBoundingBox(True)
-            if not groove_bb.IsValid:
-                continue
-
-            groove_width_x = groove_bb.Max.X - groove_bb.Min.X
-
-            if center_only_holes:
-                center_x_list = [groove_bb.Center.X]
-            else:
-                hole_row_count = default_row_count
-                # 행 간격 계산 (양 끝에 여유 공간 확보)
-                row_spacing = groove_width_x / (hole_row_count + 1)
-                center_x_list = [
-                    groove_bb.Min.X + row_spacing * (i + 1)
-                    for i in range(hole_row_count)
-                ]
-
-            for center_x in center_x_list:
-                center_y = groove_bb.Center.Y
-
-                base_point = rg.Point3d(center_x, center_y, 0)
-                top_point = rg.Point3d(center_x, center_y, height)
-                axis = rg.Line(base_point, top_point)
-                circle = rg.Circle(rg.Plane(base_point, rg.Vector3d.ZAxis), hole_radius)
-                cylinder = rg.Cylinder(circle, axis.Length)
-                brep = cylinder.ToBrep(True, True)
-                if brep:
-                    hole_breps.append(brep)
-
-    # 홈/홀 모두 꺼져 있으면 Brep 파이프라인을 건너뛰고 단순 박스 메쉬만 사용
-    if not ENABLE_GROOVES and not ENABLE_HOLES:
+    # 홈이 꺼져 있으면 Brep 파이프라인을 건너뛰고 단순 박스 메쉬만 사용
+    if not ENABLE_GROOVES:
         current_support_meshes = [support_box_mesh]
     else:
         # --- 2-3. 바닥 홈 + 수직홀을 base Brep에서 차집합 ---
@@ -165,8 +128,6 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
             tool_breps = []
             if ENABLE_GROOVES:
                 tool_breps.extend(groove_breps)
-            if ENABLE_HOLES:
-                tool_breps.extend(hole_breps)
 
             result_breps = [base_brep]
             if tool_breps:
@@ -205,15 +166,13 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
                 current_support_meshes = [base_mesh]
 
     # --- 3. 입력 메쉬들을 Z-방향으로 이동한 복사본 생성 (offset 메쉬 대체) ---
-    # 크라운과 서포트 사이에 약간의 클리어런스를 두기 위해 offset 보다 조금 더 많이 내린다.
     offset_meshes = []
 
-    CLEARANCE_Z = 0.02  # 크라운과 서포트 사이 목표 간격(mm)
-
+    # Z 방향 offset 메쉬: offset 값만큼만 -Z 로 이동
     try:
-        dz = float(offset) + CLEARANCE_Z
+        dz = float(offset)
     except Exception:
-        dz = CLEARANCE_Z
+        dz = 0.0
 
     move_down = rg.Transform.Translation(0.0, 0.0, -dz)
 
@@ -226,10 +185,35 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
         moved.Transform(move_down)
         offset_meshes.append(moved)
 
+    # X 방향 offset 메쉬 추가: 제품 메쉬를 +X 로 (offset * 1.5) 만큼 평행이동한 복사본
+    try:
+        dx = float(offset) * 1.5
+    except Exception:
+        dx = 0.0
+
+    if abs(dx) > 1e-6:
+        move_x = rg.Transform.Translation(dx, 0.0, 0.0)
+        for mesh in product_meshes:
+            if not mesh:
+                continue
+            moved_x = mesh.DuplicateMesh()
+            if not moved_x:
+                continue
+            moved_x.Transform(move_x)
+            offset_meshes.append(moved_x)
+
     print("[create_support] offset mesh count =", len(offset_meshes))
     if not offset_meshes:
         print("[create_support] Error: Mesh.Offset operation failed.")
         return None
+
+    # 디버그용: offset 메쉬도 화면에 표시해서, 실제 Boolean 에 사용된 형상을 직접 확인
+    if ENABLE_OFFSET_DEBUG:
+        for mesh in offset_meshes:
+            try:
+                sc.doc.Objects.AddMesh(mesh)
+            except Exception as e:
+                print("[create_support] Warning: failed to add offset mesh for debug:", e)
 
     # --- 3-1. offset 메쉬들끼리 먼저 Boolean Union 실행 (크라운 사이 교차 제거) ---
     if len(offset_meshes) > 1:
@@ -303,17 +287,6 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
         if ENABLE_OFFSET_BOOLEAN:
             print("[create_support] Warning: BooleanDifference resulted in no meshes. Using support without product offset.")
         final_support_meshes = current_support_meshes
-
-    # --- 4-2. 최종 서포트에서 원본 크라운 메쉬를 한 번 더 차집합 ---
-    # 서포트와 크라운이 겹치는 부분(인접면의 깨진 조각 등)을 강제로 제거
-    try:
-        if final_support_meshes and product_meshes:
-            print("[create_support] running final cleanup boolean with original product meshes...")
-            cleaned = rg.Mesh.CreateBooleanDifference(final_support_meshes, product_meshes)
-            if cleaned and len(cleaned) > 0:
-                final_support_meshes = list(cleaned)
-    except Exception as e:
-        print("[create_support] Warning: final cleanup boolean with product meshes failed: {}".format(e))
 
     print("[create_support] final_support_meshes count =", len(final_support_meshes))
 
@@ -453,53 +426,41 @@ def main():
     rs.MoveObjects(product, (0, 0, -z_min + 0.5))
     assign_object(product, 'print', 'product')
     
-    # 2. 여러 offset 값으로 서포트 생성 및 정렬 (메모리 최적화)
-    offsets = [0.05, 0.10, 0.15, 0.20]
+    # 2. 여러 offset 값으로 서포트 생성 및 정렬 (한 열만 사용)
+    offsets = [0.15, 0.20, 0.25]
     total_x_shift = 0.0
     all_created_objects = []
 
     try:
         rs.EnableRedraw(False)
         for offset_val in offsets:
-            # 1-1. 원본 위치에서 서포트 생성 (3행 배기홀 버전)
-            full_copy = rs.CopyObjects(product)
-            full_support_ids = create_support(full_copy, offset=str(offset_val), height=2.3, center_only_holes=False)
+            # 각 offset 값에 대해 서포트 한 세트만 생성
+            copy_objs = rs.CopyObjects(product)
+            support_ids = create_support(copy_objs, offset=str(offset_val), height=2.3, center_only_holes=False)
 
-            if full_support_ids:
-                full_group = full_copy + full_support_ids
+            if support_ids:
+                group = copy_objs + support_ids
                 bbox = rg.BoundingBox.Empty
-                for obj_id in full_group:
+                for obj_id in group:
                     obj = sc.doc.Objects.Find(obj_id)
                     if obj:
                         bbox.Union(obj.Geometry.GetBoundingBox(True))
 
                 if bbox.IsValid:
-                    # full_group의 바운딩박스를 이용해 X, Y 이동량 계산
+                    # 바운딩박스를 이용해 X 이동량 계산
                     width = bbox.Max.X - bbox.Min.X
-                    full_height_y = bbox.Max.Y - bbox.Min.Y
-                    y_gap = full_height_y + 2.0  # 서포트 높이 + 2mm 여유
 
                     # X축 정렬 (offset 별로 오른쪽으로 차례대로 배치)
-                    rs.MoveObjects(full_group, (total_x_shift, 0, 0))
-                    all_created_objects.extend(full_group)
-
-                    # 1-2. 같은 offset에 대해 가운데 1행 버전 생성
-                    center_copy = rs.CopyObjects(product)
-                    center_support_ids = create_support(center_copy, offset=str(offset_val), height=None, center_only_holes=True)
-
-                    if center_support_ids:
-                        center_group = center_copy + center_support_ids
-                        # full_group 과 같은 X 위치에서 Y 방향으로만 위로 이동
-                        rs.MoveObjects(center_group, (total_x_shift, y_gap, 0))
-                        all_created_objects.extend(center_group)
+                    rs.MoveObjects(group, (total_x_shift, 0, 0))
+                    all_created_objects.extend(group)
 
                     # 다음 offset을 위한 X축 이동량 갱신
                     total_x_shift += width + 2.0  # 서포트 사이 2mm 간격
                 else:
-                    rs.DeleteObjects(full_group)
+                    rs.DeleteObjects(group)
             else:
                 # 서포트 생성 실패 시 복사본 제거
-                rs.DeleteObjects(full_copy)
+                rs.DeleteObjects(copy_objs)
 
         # 각 루프 후 Undo 기록 삭제하여 메모리 확보
         rs.Command('-_CommandHistory _Purge _Enter', False)

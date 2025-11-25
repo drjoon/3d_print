@@ -3,7 +3,6 @@ node_modules
 .env
 __pycache__
 .pytest_cache
-.rhl
-.3dm
-.3dm.rhl
-.stl
+*.rhl
+*.3dm
+*.stl
