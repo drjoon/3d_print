@@ -185,13 +185,14 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
         moved.Transform(move_down)
         offset_meshes.append(moved)
 
-    # X 방향 offset 메쉬 추가: 제품 메쉬를 +X 로 (offset * 1.5) 만큼 평행이동한 복사본
+    # X 방향 offset 메쉬 추가: 제품 메쉬를 ±X 로 (offset * 1.0) 만큼 평행이동한 복사본
     try:
-        dx = float(offset) * 1.5
+        dx = float(offset) * 1.0
     except Exception:
         dx = 0.0
 
     if abs(dx) > 1e-6:
+        # +X 방향 offset
         move_x = rg.Transform.Translation(dx, 0.0, 0.0)
         for mesh in product_meshes:
             if not mesh:
@@ -201,6 +202,46 @@ def create_support(product_ids, offset, height=None, center_only_holes=False):
                 continue
             moved_x.Transform(move_x)
             offset_meshes.append(moved_x)
+
+        # -X 방향 offset
+        move_x_neg = rg.Transform.Translation(-dx, 0.0, 0.0)
+        for mesh in product_meshes:
+            if not mesh:
+                continue
+            moved_x_neg = mesh.DuplicateMesh()
+            if not moved_x_neg:
+                continue
+            moved_x_neg.Transform(move_x_neg)
+            offset_meshes.append(moved_x_neg)
+
+    # Y 방향 offset 메쉬 추가: 제품 메쉬를 ±Y 로 (offset * 1.0) 만큼 평행이동한 복사본
+    try:
+        dy = float(offset) * 1.0
+    except Exception:
+        dy = 0.0
+
+    if abs(dy) > 1e-6:
+        # +Y 방향 offset
+        move_y = rg.Transform.Translation(0.0, dy, 0.0)
+        for mesh in product_meshes:
+            if not mesh:
+                continue
+            moved_y = mesh.DuplicateMesh()
+            if not moved_y:
+                continue
+            moved_y.Transform(move_y)
+            offset_meshes.append(moved_y)
+
+        # -Y 방향 offset
+        move_y_neg = rg.Transform.Translation(0.0, -dy, 0.0)
+        for mesh in product_meshes:
+            if not mesh:
+                continue
+            moved_y_neg = mesh.DuplicateMesh()
+            if not moved_y_neg:
+                continue
+            moved_y_neg.Transform(move_y_neg)
+            offset_meshes.append(moved_y_neg)
 
     print("[create_support] offset mesh count =", len(offset_meshes))
     if not offset_meshes:
@@ -427,7 +468,7 @@ def main():
     assign_object(product, 'print', 'product')
     
     # 2. 여러 offset 값으로 서포트 생성 및 정렬 (한 열만 사용)
-    offsets = [0.15, 0.20, 0.25]
+    offsets = [0.10, 0.15, 0.20]
     total_x_shift = 0.0
     all_created_objects = []
 
@@ -436,7 +477,7 @@ def main():
         for offset_val in offsets:
             # 각 offset 값에 대해 서포트 한 세트만 생성
             copy_objs = rs.CopyObjects(product)
-            support_ids = create_support(copy_objs, offset=str(offset_val), height=2.3, center_only_holes=False)
+            support_ids = create_support(copy_objs, offset=str(offset_val), height=2, center_only_holes=False)
 
             if support_ids:
                 group = copy_objs + support_ids
